@@ -855,6 +855,13 @@ class TritonAttnBackend(AttentionBackend):
             kv_indices = self.forward_metadata.kv_indices
             window_kv_offsets = None
 
+        if layer.k_scale is not None and layer.v_scale is not None:
+            k_descale = layer.k_scale_float
+            v_descale = layer.v_scale_float
+        else:
+            k_descale = 1.0
+            v_descale = 1.0
+
         self.extend_attention_fwd(
             q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
             k.contiguous(),
@@ -869,8 +876,8 @@ class TritonAttnBackend(AttentionBackend):
             causal,
             self.forward_metadata.mask_indptr,
             self.forward_metadata.max_extend_len,
-            layer.k_scale_float,
-            layer.v_scale_float,
+            k_descale,
+            v_descale,
             layer.scaling,
             logit_cap=logits_soft_cap,
             sliding_window_size=sliding_window_size,
@@ -977,14 +984,21 @@ class TritonAttnBackend(AttentionBackend):
         # Convert prefix_lens to int32 for the kernel
         prefix_lens = prefix_lens.to(torch.int32)
 
+        if layer.k_scale is not None and layer.v_scale is not None:
+            k_descale = layer.k_scale_float
+            v_descale = layer.v_scale_float
+        else:
+            k_descale = 1.0
+            v_descale = 1.0
+
         # Call unified kernel
         self.extend_attention_fwd_unified(
             q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
             o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
             forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id),
             forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id),
-            layer.k_scale_float,
-            layer.v_scale_float,
+            k_descale,
+            v_descale,
             self.forward_metadata.qo_indptr,
             unified_kv_indptr,
             unified_kv_indices,
@@ -1037,6 +1051,13 @@ class TritonAttnBackend(AttentionBackend):
             kv_indptr = self.forward_metadata.kv_indptr
             kv_indices = self.forward_metadata.kv_indices
 
+        if layer.k_scale is not None and layer.v_scale is not None:
+            k_descale = layer.k_scale_float
+            v_descale = layer.v_scale_float
+        else:
+            k_descale = 1.0
+            v_descale = 1.0
+
         self.decode_attention_fwd(
             q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
             forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id),
@@ -1049,8 +1070,8 @@ class TritonAttnBackend(AttentionBackend):
             self.forward_metadata.num_kv_splits,
             self.max_kv_splits,
             layer.scaling,
-            layer.k_scale_float,
-            layer.v_scale_float,
+            k_descale,
+            v_descale,
             logit_cap=logits_soft_cap,
             sinks=sinks,
             xai_temperature_len=layer.xai_temperature_len,
