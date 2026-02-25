@@ -7,6 +7,7 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
 from sglang.srt.layers.dp_attention import get_attention_tp_size
@@ -86,6 +87,7 @@ class TritonAttnBackend(AttentionBackend):
         self.token_to_kv_pool_allocator = model_runner.token_to_kv_pool_allocator
         self.num_draft_tokens = model_runner.server_args.speculative_num_draft_tokens
         self.speculative_num_steps = model_runner.server_args.speculative_num_steps
+        self.use_mla = model_runner.model_config.attention_arch == AttentionArch.MLA
         self.num_head = (
             model_runner.model_config.num_attention_heads // get_attention_tp_size()
         )
@@ -813,14 +815,24 @@ class TritonAttnBackend(AttentionBackend):
 
         # Save KV cache first (must do this before unified kernel)
         if save_kv_cache:
-            forward_batch.token_to_kv_pool.set_kv_buffer(
-                layer,
-                forward_batch.out_cache_loc,
-                k.clone(),
-                v.clone(),
-                layer.k_scale,
-                layer.v_scale,
-            )
+            if (
+                self.use_mla or layer.k_scale is None
+            ):  # Triton MLA currently doesn't support quantized kv cache
+                forward_batch.token_to_kv_pool.set_kv_buffer(
+                    layer,
+                    forward_batch.out_cache_loc,
+                    k,
+                    v,
+                )
+            else:
+                forward_batch.token_to_kv_pool.set_kv_buffer(
+                    layer,
+                    forward_batch.out_cache_loc,
+                    k.clone(),  # cloned to protect k,v from in-place mutation in set_kv_buffer
+                    v.clone(),
+                    layer.k_scale,
+                    layer.v_scale,
+                )
 
         logits_soft_cap = logit_capping_mod(layer.logit_capping_method, layer.logit_cap)
 
@@ -1040,9 +1052,22 @@ class TritonAttnBackend(AttentionBackend):
         logits_soft_cap = logit_capping_mod(layer.logit_capping_method, layer.logit_cap)
 
         if save_kv_cache:
-            forward_batch.token_to_kv_pool.set_kv_buffer(
-                layer, forward_batch.out_cache_loc, k, v, layer.k_scale, layer.v_scale
-            )
+            if self.use_mla:  # Triton MLA currently doesn't support quantized kv cache
+                forward_batch.token_to_kv_pool.set_kv_buffer(
+                    layer,
+                    forward_batch.out_cache_loc,
+                    k,
+                    v,
+                )
+            else:
+                forward_batch.token_to_kv_pool.set_kv_buffer(
+                    layer,
+                    forward_batch.out_cache_loc,
+                    k,
+                    v,
+                    layer.k_scale,
+                    layer.v_scale,
+                )
 
         if layer.sliding_window_size is not None and layer.sliding_window_size > -1:
             kv_indptr = self.forward_metadata.window_kv_indptr
