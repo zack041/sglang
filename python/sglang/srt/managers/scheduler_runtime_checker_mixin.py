@@ -152,7 +152,8 @@ class SchedulerRuntimeCheckerMixin:
                 )
         memory_leak = (
             full_num_used != self.tree_cache.full_protected_size() + session_held
-            or mamba_num_used != self.tree_cache.mamba_protected_size() + len(waiting_held_mamba_slots)
+            or mamba_num_used
+            != self.tree_cache.mamba_protected_size() + len(waiting_held_mamba_slots)
         )
         if memory_leak:
             free_full_pages = set(
@@ -172,9 +173,14 @@ class SchedulerRuntimeCheckerMixin:
             cached_mamba_pages = set(
                 self.tree_cache.all_mamba_values_flatten().tolist()
             )
-            expected_mamba_pages = set(range(1, self.req_to_token_pool.mamba_pool.size + 1))
+            expected_mamba_pages = set(
+                range(1, self.req_to_token_pool.mamba_pool.size + 1)
+            )
             leaked_mamba_pages = (
-                expected_mamba_pages - free_mamba_pages - cached_mamba_pages - waiting_held_mamba_slots
+                expected_mamba_pages
+                - free_mamba_pages
+                - cached_mamba_pages
+                - waiting_held_mamba_slots
             )
             token_msg = (
                 f"{full_available_size=}, {full_evictable_size=}, {self.token_to_kv_pool_allocator.size=}, {self.tree_cache.full_protected_size()=}\n"
