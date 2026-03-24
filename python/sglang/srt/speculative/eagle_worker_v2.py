@@ -13,6 +13,9 @@ from sglang.srt.hardware_backend.npu.graph_runner.eagle_draft_npu_graph_runner i
     EAGLEDraftNpuGraphRunner,
 )
 from sglang.srt.layers.attention.triton_backend import TritonMultiStepDraftBackend
+from sglang.srt.layers.attention.triton_mla_backend import (
+    TritonMLAMultiStepDraftBackend,
+)
 from sglang.srt.layers.attention.trtllm_mla_backend import (
     TRTLLMMLAMultiStepDraftBackend,
 )
@@ -295,6 +298,7 @@ class EagleDraftWorker(BaseDraftWorker):
 
         supports_cuda_draft_extend_graph = _is_cuda and (
             isinstance(self.draft_attn_backend, TritonMultiStepDraftBackend)
+            or isinstance(self.draft_attn_backend, TritonMLAMultiStepDraftBackend)
             or isinstance(self.draft_attn_backend, TRTLLMMLAMultiStepDraftBackend)
         )
         # Capture extend
