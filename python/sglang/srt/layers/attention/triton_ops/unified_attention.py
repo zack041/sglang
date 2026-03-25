@@ -1,8 +1,5 @@
 # Adapted from https://github.com/vllm-project/vllm/blob/main/vllm/v1/attention/ops/triton_unified_attention.py
 # TODO:
-# - BLOCK_DPE for MLA (DeepSeek V2/V3)
-# - Lk != Lv support (MLA: Lk=576, Lv=512)
-# - xai_temperature (Grok)
 # - custom_mask for spec decoding
 # - hardware specific tile size tuning
 # - continuous access to extending k/v
@@ -95,6 +92,7 @@ def kernel_unified_attention_2d(
     BLOCK_Q: tl.constexpr,  # int
     num_seqs: tl.int32,
     BLOCK_M: tl.constexpr,  # int
+    xai_temperature_len: tl.constexpr,
     USE_FP8: tl.constexpr,  # bool
     FP8_MIN: tl.constexpr = float8_info.min,
     FP8_MAX: tl.constexpr = float8_info.max,
@@ -256,10 +254,19 @@ def kernel_unified_attention_2d(
         if SLIDING_WINDOW > 0:
             seq_mask = seq_mask & ((query_abs_pos - seq_offset) < SLIDING_WINDOW)
 
+        if xai_temperature_len > 0:
+            offs_qidx = query_abs_pos
+            xai_temperature_scale = 1.0 / tl.log2(float(xai_temperature_len))
+            _qtemp = tl.log2(offs_qidx.to(tl.float32)) * xai_temperature_scale
+            xai_temperature_reg = tl.where(offs_qidx > xai_temperature_len, _qtemp, 1.0)
+
         # S : (BLOCK_M, TILE_SIZE)
         S = tl.zeros(shape=(BLOCK_M, TILE_SIZE), dtype=tl.float32)
 
         S += scale * tl.dot(Q, K)
+
+        if xai_temperature_len > 0:
+            S *= xai_temperature_reg
 
         if USE_SOFTCAP:
             S = apply_softcap(S, softcap)
@@ -357,6 +364,7 @@ def kernel_unified_attention_3d(
     num_seqs: tl.int32,
     BLOCK_M: tl.constexpr,  # int
     NUM_SEGMENTS_PER_SEQ: tl.constexpr,  # int
+    xai_temperature_len: tl.constexpr,
 ):
     q_block_global_idx = tl.program_id(0)
     kv_head_idx = tl.program_id(1)
@@ -533,9 +541,18 @@ def kernel_unified_attention_3d(
         if SLIDING_WINDOW > 0:
             seq_mask = seq_mask & ((query_abs_pos - seq_offset) < SLIDING_WINDOW)
 
+        if xai_temperature_len > 0:
+            offs_qidx = query_abs_pos
+            xai_temperature_scale = 1.0 / tl.log2(float(xai_temperature_len))
+            _qtemp = tl.log2(offs_qidx.to(tl.float32)) * xai_temperature_scale
+            xai_temperature_reg = tl.where(offs_qidx > xai_temperature_len, _qtemp, 1.0)
+
         # S : (BLOCK_M, TILE_SIZE)
         S = tl.zeros(shape=(BLOCK_M, TILE_SIZE), dtype=tl.float32)
         S += scale * tl.dot(Q, K)
+
+        if xai_temperature_len > 0:
+            S *= xai_temperature_reg
 
         if USE_SOFTCAP:
             S = apply_softcap(S, softcap)
@@ -733,6 +750,7 @@ def unified_attention(
     softmax_segm_expsum=None,
     output_scale=None,
     sinks=None,
+    xai_temperature_len=-1,
 ):
     """
     Args:
@@ -824,6 +842,7 @@ def unified_attention(
             BLOCK_M=BLOCK_M,
             USE_FP8=output_scale is not None,
             num_warps=8,
+            xai_temperature_len=xai_temperature_len,
         )
     else:
         kernel_unified_attention_3d[
@@ -864,6 +883,7 @@ def unified_attention(
             BLOCK_M=BLOCK_M,
             NUM_SEGMENTS_PER_SEQ=num_par_softmax_segments,
             num_warps=8,
+            xai_temperature_len=xai_temperature_len,
         )
         reduce_segments[(q.shape[0], num_query_heads)](
             output_ptr=out,
