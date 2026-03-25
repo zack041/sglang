@@ -70,6 +70,8 @@ def kernel_unified_attention_2d(
     v_scale,  # float32
     out_scale,  # float32
     softcap,  # float32
+    mask_ptr,  # [\sum_{i<batch_size}(q_len_i * kv_len_i)]
+    mask_indptr,  # [batch_size+1]
     num_query_heads: tl.constexpr,  # int
     num_queries_per_kv: tl.constexpr,  # int
     query_stride_0: tl.int64,  # int
@@ -92,6 +94,7 @@ def kernel_unified_attention_2d(
     BLOCK_Q: tl.constexpr,  # int
     num_seqs: tl.int32,
     BLOCK_M: tl.constexpr,  # int
+    USE_CUSTOM_MASK: tl.constexpr,  # bool
     xai_temperature_len: tl.constexpr,
     USE_FP8: tl.constexpr,  # bool
     FP8_MIN: tl.constexpr = float8_info.min,
@@ -110,6 +113,9 @@ def kernel_unified_attention_2d(
 
     cur_batch_in_all_start_index = tl.load(query_start_len_ptr + seq_idx)
     cur_batch_in_all_stop_index = tl.load(query_start_len_ptr + seq_idx + 1)
+
+    if USE_CUSTOM_MASK:
+        cur_seq_mask_start_idx = tl.load(mask_indptr + seq_idx)
 
     cur_batch_query_len = cur_batch_in_all_stop_index - cur_batch_in_all_start_index
 
@@ -271,9 +277,29 @@ def kernel_unified_attention_2d(
         if USE_SOFTCAP:
             S = apply_softcap(S, softcap)
 
-        S = tl.where(
-            query_mask_1[:, None] & query_mask_0[:, None] & seq_mask, S, float("-inf")
-        )
+        if not USE_CUSTOM_MASK:
+            S = tl.where(
+                query_mask_1[:, None] & query_mask_0[:, None] & seq_mask,
+                S,
+                float("-inf"),
+            )
+        else:
+            custom_mask = (
+                tl.load(
+                    mask_ptr
+                    + cur_seq_mask_start_idx
+                    + query_pos[:, None] * seq_len
+                    + seq_offset,
+                    mask=(query_mask_0[:, None] & kv_mask),
+                    other=0,
+                )
+                != 0
+            )
+            S = tl.where(
+                query_mask_1[:, None] & query_mask_0[:, None] & custom_mask,
+                S,
+                float("-inf"),
+            )
 
         # compute running maximum
         # m_j : (BLOCK_M,)
@@ -743,6 +769,8 @@ def unified_attention(
     softcap=0.0,
     k_scale=1.0,
     v_scale=1.0,
+    custom_mask=None,
+    mask_indptr=None,
     seq_threshold_3D=None,
     num_par_softmax_segments=None,
     softmax_segm_output=None,
@@ -762,11 +790,15 @@ def unified_attention(
         max_seqlen_q: max query length (>1: prefill, =1: decode)
         kv_indptr: start of kv [num_seqs+1]
         kv_indices: physical kv indices [total_kv_tokens]
+        softmax_scale: softmax scale
         sliding_window_size: -1 for no sliding window
         softcap: 0.0 for no capping
+        custom_mask: custom mask for spec decode
+        mask_indptr: stores the index of the mask of sequences
         seq_threshold_3D: threshold for kv split
         num_par_softmax_segments: number of parallel softmax segments for 3D kernel
         softmax_segm_output, softmax_segm_max, softmax_segm_expsum: intermediate buffer for 3D kernel
+        output_scale: not available
     """
     if sinks is not None:
         assert sinks.shape[0] == q.shape[1], "Sinks must be num_query_heads size"
@@ -799,6 +831,7 @@ def unified_attention(
         or max_seqlen_q > 1
         or num_seqs > seq_threshold_3D
         or is_batch_invariant
+        or custom_mask is not None
     ):
         kernel_unified_attention_2d[
             (
@@ -818,6 +851,8 @@ def unified_attention(
             v_scale=v_scale,
             out_scale=1 / output_scale if output_scale is not None else 1.0,
             softcap=softcap,
+            mask_ptr=custom_mask,
+            mask_indptr=mask_indptr,
             num_query_heads=num_query_heads,
             num_queries_per_kv=num_queries_per_kv,
             query_stride_0=q.stride(0),
@@ -842,6 +877,7 @@ def unified_attention(
             BLOCK_M=BLOCK_M,
             USE_FP8=output_scale is not None,
             num_warps=8,
+            USE_CUSTOM_MASK=custom_mask is not None,
             xai_temperature_len=xai_temperature_len,
         )
     else:
