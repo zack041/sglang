@@ -792,7 +792,10 @@ def unified_attention(
     """
     BLOCK_M, TILE_SIZE, warps still need to be tuned
     """
-    BLOCK_M = 128
+    if max_seqlen_q == 1:
+        BLOCK_M = max(16, num_queries_per_kv)  # decode
+    else:
+        BLOCK_M = 128  # prefill
     BLOCK_Q = BLOCK_M // num_queries_per_kv
 
     total_num_q_blocks = q.shape[0] // BLOCK_Q + num_seqs

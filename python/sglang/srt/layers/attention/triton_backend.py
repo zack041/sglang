@@ -266,21 +266,46 @@ class TritonAttnBackend(AttentionBackend):
             mask_indptr = mask_indptr[: bs + 1]
             max_extend_len = self.num_draft_tokens
 
-        elif forward_batch.forward_mode.is_draft_extend():
-            kv_indices, kv_indptr, qo_indptr, custom_mask = (
-                spec_info.generate_attn_arg_prefill(
+        elif forward_batch.forward_mode.is_draft_extend(include_v2=True):
+            if forward_batch.forward_mode.is_draft_extend_v2():
+                accept_lens = spec_info.accept_length[:bs]
+                qo_indptr = self.qo_indptr[: bs + 1]
+                qo_indptr[0] = 0
+                qo_indptr[1 : bs + 1] = torch.cumsum(accept_lens, dim=0)
+                kv_indptr = self.kv_indptr[: bs + 1]
+                kv_indptr[1 : bs + 1] = torch.cumsum(forward_batch.seq_lens, dim=0)
+                kv_indices = torch.empty(
+                    kv_indptr[-1],
+                    dtype=torch.int64,
+                    device=self.device,
+                )
+                create_flashinfer_kv_indices_triton[(bs,)](
+                    self.req_to_token,
                     forward_batch.req_pool_indices,
                     forward_batch.seq_lens,
+                    kv_indptr,
                     None,
-                    self.req_to_token,
+                    kv_indices,
+                    self.req_to_token.stride(0),
                 )
-            )
-            kv_indices = kv_indices.to(torch.int64)
-            mask_indptr = None
-            # TODO(FIXME): This will trigger an invalid Eagle tree when using
-            # `max(spec_info.accept_length_cpu)`.
-            # It might have been forgotten to update somewhere.
-            max_extend_len = torch.max(spec_info.accept_length).item()
+                custom_mask = None
+                mask_indptr = None
+                max_extend_len = torch.max(accept_lens).item()
+            else:
+                kv_indices, kv_indptr, qo_indptr, custom_mask = (
+                    spec_info.generate_attn_arg_prefill(
+                        forward_batch.req_pool_indices,
+                        forward_batch.seq_lens,
+                        None,
+                        self.req_to_token,
+                    )
+                )
+                kv_indices = kv_indices.to(torch.int64)
+                mask_indptr = None
+                # TODO(FIXME): This will trigger an invalid Eagle tree when using
+                # `max(spec_info.accept_length_cpu)`.
+                # It might have been forgotten to update somewhere.
+                max_extend_len = torch.max(spec_info.accept_length).item()
         else:
             kv_indptr[1 : bs + 1] = torch.cumsum(forward_batch.seq_lens, dim=0)
             kv_indptr = kv_indptr[: bs + 1]
