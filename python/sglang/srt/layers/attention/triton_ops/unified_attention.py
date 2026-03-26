@@ -93,6 +93,7 @@ def kernel_unified_attention_2d(
     BLOCK_M: tl.constexpr,  # int
     USE_CUSTOM_MASK: tl.constexpr,  # bool
     xai_temperature_len: tl.constexpr,
+    is_causal: tl.constexpr,  # bool
     USE_FP8: tl.constexpr,  # bool
     FP8_MIN: tl.constexpr = float8_info.min,
     FP8_MAX: tl.constexpr = float8_info.max,
@@ -178,10 +179,13 @@ def kernel_unified_attention_2d(
     # calculate the number of tiles
     num_tiles = cdiv_fn(max_seq_prefix_len, TILE_SIZE)
 
-    # ---- Sliding-window tile pruning --------------------
+    if not is_causal:
+        num_tiles = cdiv_fn(seq_len, TILE_SIZE)
+
+    # ---- Sliding-window tile pruning -------------------- (for causal models only, in the future we could extend this optimization to non-causal models)
     tile_start = 0
     tile_end = num_tiles
-    if SLIDING_WINDOW > 0:
+    if SLIDING_WINDOW > 0 and is_causal:
         qpos_lo = q_block_local_idx * BLOCK_Q
         qpos_hi = tl.minimum(
             qpos_lo + (BLOCK_M - 1) // num_queries_per_kv,
@@ -254,9 +258,6 @@ def kernel_unified_attention_2d(
         query_abs_pos = context_len + query_pos[:, None]
         seq_mask = seq_offset[None, :] <= query_abs_pos
 
-        if SLIDING_WINDOW > 0:
-            seq_mask = seq_mask & ((query_abs_pos - seq_offset) < SLIDING_WINDOW)
-
         if xai_temperature_len > 0:
             offs_qidx = query_abs_pos
             xai_temperature_scale = 1.0 / tl.log2(float(xai_temperature_len))
@@ -274,13 +275,12 @@ def kernel_unified_attention_2d(
         if USE_SOFTCAP:
             S = apply_softcap(S, softcap)
 
-        if not USE_CUSTOM_MASK:
-            S = tl.where(
-                query_mask_1[:, None] & query_mask_0[:, None] & seq_mask,
-                S,
-                float("-inf"),
-            )
-        else:
+        final_mask = query_mask_1[:, None] & query_mask_0[:, None]
+
+        if SLIDING_WINDOW > 0:
+            final_mask = final_mask & ((query_abs_pos - seq_offset) < SLIDING_WINDOW)
+
+        if USE_CUSTOM_MASK:
             custom_mask = (
                 tl.load(
                     mask_ptr
@@ -292,11 +292,17 @@ def kernel_unified_attention_2d(
                 )
                 != 0
             )
-            S = tl.where(
-                query_mask_1[:, None] & query_mask_0[:, None] & custom_mask,
-                S,
-                float("-inf"),
-            )
+            final_mask &= custom_mask
+        elif is_causal:
+            final_mask &= seq_mask
+        else:
+            final_mask &= kv_mask[None, :]
+
+        S = tl.where(
+            final_mask,
+            S,
+            float("-inf"),
+        )
 
         # compute running maximum
         # m_j : (BLOCK_M,)
@@ -752,6 +758,7 @@ def unified_attention(
     sinks=None,
     xai_temperature_len=-1,
     enable_deterministic=False,
+    is_causal=True,
 ):
     """
     Args:
@@ -805,6 +812,7 @@ def unified_attention(
         or num_seqs > seq_threshold_3D
         or enable_deterministic
         or custom_mask is not None
+        or is_causal == False
     ):
         kernel_unified_attention_2d[
             (
@@ -852,6 +860,7 @@ def unified_attention(
             num_warps=8,
             USE_CUSTOM_MASK=custom_mask is not None,
             xai_temperature_len=xai_temperature_len,
+            is_causal=is_causal,
         )
     else:
         kernel_unified_attention_3d[
