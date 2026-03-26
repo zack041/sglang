@@ -1,9 +1,7 @@
 # Adapted from https://github.com/vllm-project/vllm/blob/main/vllm/v1/attention/ops/triton_unified_attention.py
-# TODO:
-# - custom_mask for spec decoding
+# Future work:
 # - hardware specific tile size tuning
 # - continuous access to extending k/v
-# - enable non-causal attention
 
 import logging
 
@@ -18,7 +16,6 @@ _is_hip = is_hip()
 
 
 logger = logging.getLogger(__name__)
-is_batch_invariant = False
 float8_dtype = torch.float8_e4m3fnuz if _is_hip else torch.float8_e4m3fn
 float8_info = torch.finfo(float8_dtype)
 
@@ -730,31 +727,6 @@ def reduce_segments(
     tl.store(output_ptr + output_offset, acc, mask=dim_mask)
 
 
-def _is_gemma3_attention(head_size: int, sliding_window: int) -> bool:
-    """Detect Gemma3 models via unique (head_size, sliding_window) signature.
-
-    Gemma3 models are the only ones using sliding_window=1024 with
-    head_size 128 (27B) or 256 (1B, 4B, 12B). Other SWA models use
-    different window sizes (Mistral=4096, Phi-3=2047).
-    """
-    return sliding_window == 1024 and head_size in (128, 256)
-
-
-def _get_tile_size(
-    head_size: int,
-    sliding_window: int,
-    element_size: int,
-    is_prefill: bool,
-) -> int:
-    """Select tile size with Gemma3-specific optimization."""
-    if _is_gemma3_attention(head_size, sliding_window):
-        return 32
-
-    if is_prefill:
-        return 32
-    return 16 if element_size >= 2 else 32
-
-
 def unified_attention(
     q,
     k,
@@ -779,6 +751,7 @@ def unified_attention(
     output_scale=None,
     sinks=None,
     xai_temperature_len=-1,
+    enable_deterministic=False,
 ):
     """
     Args:
@@ -830,7 +803,7 @@ def unified_attention(
         or softmax_segm_expsum is None
         or max_seqlen_q > 1
         or num_seqs > seq_threshold_3D
-        or is_batch_invariant
+        or enable_deterministic
         or custom_mask is not None
     ):
         kernel_unified_attention_2d[

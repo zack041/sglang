@@ -729,6 +729,7 @@ class TritonAttnBackend(AttentionBackend):
             softmax_segm_expsum=self.softmax_segm_expsum,
             sinks=sinks,
             xai_temperature_len=layer.xai_temperature_len,
+            enable_deterministic=self.enable_deterministic,
         )
         return o
 
@@ -811,6 +812,7 @@ class TritonAttnBackend(AttentionBackend):
             softmax_segm_expsum=self.softmax_segm_expsum,
             sinks=sinks,
             xai_temperature_len=layer.xai_temperature_len,
+            enable_deterministic=self.enable_deterministic,
         )
         return o
 
