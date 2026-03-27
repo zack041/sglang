@@ -194,17 +194,20 @@ class TritonAttnBackend(AttentionBackend):
                     self.sliding_window_size is not None
                     and self.sliding_window_size > 0
                 ):
-                    window_kv_indptr, window_kv_indices, _, _ = (
-                        update_sliding_window_buffer(
-                            self.window_kv_indptr,
-                            self.req_to_token,
-                            self.sliding_window_size,
-                            forward_batch.seq_lens,
-                            forward_batch.req_pool_indices,
-                            bs,
-                            self.device,
-                            self.token_to_kv_pool_allocator,
-                        )
+                    (
+                        window_kv_indptr,
+                        window_kv_indices,
+                        _,
+                        window_kv_offsets,
+                    ) = update_sliding_window_buffer(
+                        self.window_kv_indptr,
+                        self.req_to_token,
+                        self.sliding_window_size,
+                        forward_batch.seq_lens,
+                        forward_batch.req_pool_indices,
+                        bs,
+                        self.device,
+                        self.token_to_kv_pool_allocator,
                     )
             else:
                 kv_indptr, kv_indices = spec_info.kv_indptr, spec_info.kv_indices
@@ -433,17 +436,21 @@ class TritonAttnBackend(AttentionBackend):
                     and self.sliding_window_size > 0
                 ):
                     window_kv_indices = self.cuda_graph_window_kv_indices
-                    window_kv_indptr, window_kv_indices, _, _ = (
-                        update_sliding_window_buffer_cuda_graph(
-                            self.window_kv_indptr,
-                            window_kv_indices,
-                            self.req_to_token,
-                            self.sliding_window_size,
-                            seq_lens[:bs],
-                            req_pool_indices,
-                            bs,
-                            self.token_to_kv_pool_allocator,
-                        )
+                    window_kv_offsets = self.cuda_graph_window_kv_offsets
+                    (
+                        window_kv_indptr,
+                        window_kv_indices,
+                        _,
+                        window_kv_offsets[:bs],
+                    ) = update_sliding_window_buffer_cuda_graph(
+                        self.window_kv_indptr,
+                        window_kv_indices,
+                        self.req_to_token,
+                        self.sliding_window_size,
+                        seq_lens[:bs],
+                        req_pool_indices,
+                        bs,
+                        self.token_to_kv_pool_allocator,
                     )
             else:
                 kv_indptr, kv_indices = spec_info.kv_indptr, spec_info.kv_indices
@@ -567,15 +574,18 @@ class TritonAttnBackend(AttentionBackend):
                     and self.sliding_window_size > 0
                 ):
                     window_kv_indices = self.cuda_graph_window_kv_indices
-                    update_sliding_window_buffer_cuda_graph(
-                        self.window_kv_indptr,
-                        window_kv_indices,
-                        self.req_to_token,
-                        self.sliding_window_size,
-                        seq_lens[:bs],
-                        req_pool_indices[:bs],
-                        bs,
-                        self.token_to_kv_pool_allocator,
+                    window_kv_offsets = self.cuda_graph_window_kv_offsets
+                    _, _, _, window_kv_offsets[:bs] = (
+                        update_sliding_window_buffer_cuda_graph(
+                            self.window_kv_indptr,
+                            window_kv_indices,
+                            self.req_to_token,
+                            self.sliding_window_size,
+                            seq_lens[:bs],
+                            req_pool_indices[:bs],
+                            bs,
+                            self.token_to_kv_pool_allocator,
+                        )
                     )
 
             else:
@@ -714,15 +724,16 @@ class TritonAttnBackend(AttentionBackend):
         ):
             causal = False
 
-        bs = forward_batch.batch_size
         if layer.sliding_window_size is not None and layer.sliding_window_size > -1:
             sliding_window_size = layer.sliding_window_size
-            kv_indptr = self.forward_metadata.window_kv_indptr
-            kv_indices = self.forward_metadata.window_kv_indices
+            kv_indptr = self.forward_metadata.kv_indptr
+            kv_indices = self.forward_metadata.kv_indices
+            window_start_pos = None
         else:
             sliding_window_size = -1
             kv_indptr = self.forward_metadata.kv_indptr
             kv_indices = self.forward_metadata.kv_indices
+            window_start_pos = None
 
         if layer.k_scale is not None and layer.v_scale is not None:
             k_descale = layer.k_scale_float
@@ -756,6 +767,7 @@ class TritonAttnBackend(AttentionBackend):
             xai_temperature_len=layer.xai_temperature_len,
             enable_deterministic=self.enable_deterministic,
             is_causal=causal,
+            window_start_pos=window_start_pos,
         )
         return o
 
@@ -803,10 +815,12 @@ class TritonAttnBackend(AttentionBackend):
             kv_indptr = self.forward_metadata.window_kv_indptr
             kv_indices = self.forward_metadata.window_kv_indices
             sliding_window_size = layer.sliding_window_size
+            window_start_pos = self.forward_metadata.window_kv_offsets
         else:
             kv_indptr = self.forward_metadata.kv_indptr
             kv_indices = self.forward_metadata.kv_indices
             sliding_window_size = -1
+            window_start_pos = None
 
         if layer.k_scale is not None and layer.v_scale is not None:
             k_descale = layer.k_scale_float
@@ -839,6 +853,7 @@ class TritonAttnBackend(AttentionBackend):
             sinks=sinks,
             xai_temperature_len=layer.xai_temperature_len,
             enable_deterministic=self.enable_deterministic,
+            window_start_pos=window_start_pos,
         )
         return o
 

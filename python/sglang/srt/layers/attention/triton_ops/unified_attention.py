@@ -69,6 +69,7 @@ def kernel_unified_attention_2d(
     softcap,  # float32
     mask_ptr,  # [\sum_{i<batch_size}(q_len_i * kv_len_i)]
     mask_indptr,  # [batch_size+1]
+    window_start_pos_ptr,  # [batch_size], absolute key start for window kv
     num_query_heads: tl.constexpr,  # int
     num_queries_per_kv: tl.constexpr,  # int
     query_stride_0: tl.int64,  # int
@@ -93,6 +94,7 @@ def kernel_unified_attention_2d(
     BLOCK_M: tl.constexpr,  # int
     USE_CUSTOM_MASK: tl.constexpr,  # bool
     xai_temperature_len: tl.constexpr,
+    USE_WINDOW_START_POS: tl.constexpr,  # bool
     is_causal: tl.constexpr,  # bool
     USE_FP8: tl.constexpr,  # bool
     FP8_MIN: tl.constexpr = float8_info.min,
@@ -160,6 +162,11 @@ def kernel_unified_attention_2d(
     kv_start = tl.load(kv_indptr_ptr + seq_idx)
     kv_end = tl.load(kv_indptr_ptr + seq_idx + 1)
     seq_len = kv_end - kv_start
+
+    if USE_WINDOW_START_POS:
+        window_start = tl.load(window_start_pos_ptr + seq_idx)
+    else:
+        window_start = 0
 
     # context length for this particular sequence
     context_len = seq_len - cur_batch_query_len
@@ -255,8 +262,9 @@ def kernel_unified_attention_2d(
             V = V_load
 
         # Compute attention mask: causal by default (key <= query)
-        query_abs_pos = context_len + query_pos[:, None]
-        seq_mask = seq_offset[None, :] <= query_abs_pos
+        query_abs_pos = window_start + context_len + query_pos[:, None]
+        key_abs_pos = window_start + seq_offset[None, :]
+        seq_mask = key_abs_pos <= query_abs_pos
 
         if xai_temperature_len > 0:
             offs_qidx = query_abs_pos
@@ -278,7 +286,7 @@ def kernel_unified_attention_2d(
         final_mask = query_mask_1[:, None] & query_mask_0[:, None]
 
         if SLIDING_WINDOW > 0:
-            final_mask = final_mask & ((query_abs_pos - seq_offset) < SLIDING_WINDOW)
+            final_mask = final_mask & ((query_abs_pos - key_abs_pos) < SLIDING_WINDOW)
 
         if USE_CUSTOM_MASK:
             custom_mask = (
@@ -372,6 +380,7 @@ def kernel_unified_attention_3d(
     k_scale,  # float32
     v_scale,  # float32
     softcap,  # float32
+    window_start_pos_ptr,  # [batch_size], absolute key start for window kv
     num_query_heads: tl.constexpr,  # int
     num_queries_per_kv: tl.constexpr,  # int
     query_stride_0: tl.int64,  # int
@@ -394,6 +403,7 @@ def kernel_unified_attention_3d(
     BLOCK_M: tl.constexpr,  # int
     NUM_SEGMENTS_PER_SEQ: tl.constexpr,  # int
     xai_temperature_len: tl.constexpr,
+    USE_WINDOW_START_POS: tl.constexpr,  # bool
 ):
     q_block_global_idx = tl.program_id(0)
     kv_head_idx = tl.program_id(1)
@@ -419,6 +429,11 @@ def kernel_unified_attention_3d(
     kv_start = tl.load(kv_indptr_ptr + seq_idx)
     kv_end = tl.load(kv_indptr_ptr + seq_idx + 1)
     seq_len = kv_end - kv_start
+
+    if USE_WINDOW_START_POS:
+        window_start = tl.load(window_start_pos_ptr + seq_idx)
+    else:
+        window_start = 0
 
     # number of segments for this particular sequence
     num_segments = NUM_SEGMENTS_PER_SEQ
@@ -564,11 +579,12 @@ def kernel_unified_attention_3d(
             V = V_load
 
         # Compute attention mask
-        query_abs_pos = context_len + query_pos[:, None]
-        seq_mask = seq_offset[None, :] <= query_abs_pos
+        query_abs_pos = window_start + context_len + query_pos[:, None]
+        key_abs_pos = window_start + seq_offset[None, :]
+        seq_mask = key_abs_pos <= query_abs_pos
 
         if SLIDING_WINDOW > 0:
-            seq_mask = seq_mask & ((query_abs_pos - seq_offset) < SLIDING_WINDOW)
+            seq_mask = seq_mask & ((query_abs_pos - key_abs_pos) < SLIDING_WINDOW)
 
         if xai_temperature_len > 0:
             offs_qidx = query_abs_pos
@@ -759,6 +775,7 @@ def unified_attention(
     xai_temperature_len=-1,
     enable_deterministic=False,
     is_causal=True,
+    window_start_pos=None,
 ):
     """
     Args:
@@ -775,6 +792,7 @@ def unified_attention(
         softcap: 0.0 for no capping
         custom_mask: custom mask for spec decode
         mask_indptr: stores the index of the mask of sequences
+        window_start_pos: absolute key start position per sequence for windowed kv
         seq_threshold_3D: threshold for kv split
         num_par_softmax_segments: number of parallel softmax segments for 3D kernel
         softmax_segm_output, softmax_segm_max, softmax_segm_expsum: intermediate buffer for 3D kernel
@@ -792,10 +810,17 @@ def unified_attention(
     """
     BLOCK_M, TILE_SIZE, warps still need to be tuned
     """
-    if max_seqlen_q == 1:
-        BLOCK_M = max(16, num_queries_per_kv)  # decode
-    else:
-        BLOCK_M = 128  # prefill
+    if max_seqlen_q == 1:  # decode
+        BLOCK_M = max(16, num_queries_per_kv)
+        num_warps = 4
+    else:  # prefill
+        BLOCK_M = 128
+        num_warps = 8
+
+    if _is_hip:
+        BLOCK_M = min(64, BLOCK_M)
+        num_warps = 4
+
     BLOCK_Q = BLOCK_M // num_queries_per_kv
 
     total_num_q_blocks = q.shape[0] // BLOCK_Q + num_seqs
@@ -837,6 +862,7 @@ def unified_attention(
             softcap=softcap,
             mask_ptr=custom_mask,
             mask_indptr=mask_indptr,
+            window_start_pos_ptr=window_start_pos,
             num_query_heads=num_query_heads,
             num_queries_per_kv=num_queries_per_kv,
             query_stride_0=q.stride(0),
@@ -860,9 +886,10 @@ def unified_attention(
             num_seqs=num_seqs,
             BLOCK_M=BLOCK_M,
             USE_FP8=output_scale is not None,
-            num_warps=8,
+            num_warps=num_warps,
             USE_CUSTOM_MASK=custom_mask is not None,
             xai_temperature_len=xai_temperature_len,
+            USE_WINDOW_START_POS=window_start_pos is not None,
             is_causal=is_causal,
         )
     else:
@@ -882,6 +909,7 @@ def unified_attention(
             k_scale=k_scale,
             v_scale=v_scale,
             softcap=softcap,
+            window_start_pos_ptr=window_start_pos,
             num_query_heads=num_query_heads,
             num_queries_per_kv=num_queries_per_kv,
             query_stride_0=q.stride(0),
@@ -903,8 +931,9 @@ def unified_attention(
             num_seqs=num_seqs,
             BLOCK_M=BLOCK_M,
             NUM_SEGMENTS_PER_SEQ=num_par_softmax_segments,
-            num_warps=8,
+            num_warps=num_warps,
             xai_temperature_len=xai_temperature_len,
+            USE_WINDOW_START_POS=window_start_pos is not None,
         )
         reduce_segments[(q.shape[0], num_query_heads)](
             output_ptr=out,
@@ -924,5 +953,5 @@ def unified_attention(
             BLOCK_Q=BLOCK_Q,
             NUM_SEGMENTS_PER_SEQ=num_par_softmax_segments,
             USE_FP8=output_scale is not None,
-            num_warps=8,
+            num_warps=num_warps,
         )
