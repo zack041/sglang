@@ -646,7 +646,7 @@ class TritonAttnBackend(AttentionBackend):
             kv_indices = self.cuda_graph_kv_indices
             create_flashinfer_kv_indices_triton[(bs,)](
                 self.req_to_token,
-                req_pool_indices,
+                req_pool_indices[:bs],
                 seq_lens,
                 kv_indptr,
                 None,

@@ -808,8 +808,11 @@ def unified_attention(
     head_size = q.shape[2]
 
     """
-    BLOCK_M, TILE_SIZE, warps still need to be tuned
+    BLOCK_M, TILE_SIZE, warps, num_stages can still be tuned
     """
+
+    num_stages = 2
+
     if max_seqlen_q == 1:  # decode
         BLOCK_M = max(16, num_queries_per_kv)
         num_warps = 4
@@ -817,18 +820,24 @@ def unified_attention(
         BLOCK_M = 128
         num_warps = 8
 
-    if _is_hip:
+    if _is_hip:  # reduce shared memory and register pressure for amd gpu
         BLOCK_M = min(64, BLOCK_M)
         num_warps = 4
+        num_stages = 1
+
+    TILE_SIZE_PREFILL = 64
+    TILE_SIZE_DECODE = 64
+
+    if head_size == 256:  # reduce shared memory pressure for gemma models
+        TILE_SIZE_PREFILL = 32
+        TILE_SIZE_DECODE = 32
+        BLOCK_M = min(BLOCK_M, 64)
 
     BLOCK_Q = BLOCK_M // num_queries_per_kv
 
     total_num_q_blocks = q.shape[0] // BLOCK_Q + num_seqs
 
     sliding_window_val = sliding_window_size + 1 if sliding_window_size > 0 else 0
-
-    TILE_SIZE_PREFILL = 64
-    TILE_SIZE_DECODE = 64
 
     if (
         seq_threshold_3D is None
@@ -891,6 +900,7 @@ def unified_attention(
             xai_temperature_len=xai_temperature_len,
             USE_WINDOW_START_POS=window_start_pos is not None,
             is_causal=is_causal,
+            num_stages=num_stages,
         )
     else:
         kernel_unified_attention_3d[
@@ -934,6 +944,7 @@ def unified_attention(
             num_warps=num_warps,
             xai_temperature_len=xai_temperature_len,
             USE_WINDOW_START_POS=window_start_pos is not None,
+            num_stages=num_stages,
         )
         reduce_segments[(q.shape[0], num_query_heads)](
             output_ptr=out,
