@@ -12,6 +12,8 @@ import triton.language as tl
 from sglang.srt.utils import is_cuda, is_hip
 
 _is_cuda = is_cuda()
+if _is_cuda:
+    CUDA_CAPABILITY = torch.cuda.get_device_capability()
 _is_hip = is_hip()
 
 
@@ -811,10 +813,15 @@ def unified_attention(
     BLOCK_M, TILE_SIZE, warps, num_stages can still be tuned
     """
 
-    num_stages = 2
+    num_stages = None
+
+    if (
+        _is_cuda and CUDA_CAPABILITY[0] == 12
+    ):  # sm120 has small smem and triton can have problem auto-selecting it
+        num_stages = 2
 
     if max_seqlen_q == 1:  # decode
-        BLOCK_M = max(16, num_queries_per_kv)
+        BLOCK_M = max(8, num_queries_per_kv)
         num_warps = 4
     else:  # prefill
         BLOCK_M = 128
