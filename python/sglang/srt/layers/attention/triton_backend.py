@@ -270,7 +270,7 @@ class TritonAttnBackend(AttentionBackend):
             max_extend_len = self.num_draft_tokens
 
         elif forward_batch.forward_mode.is_draft_extend(include_v2=True):
-            if forward_batch.forward_mode.is_draft_extend_v2():
+            if spec_info.accept_length is None:
                 extend_seq_lens = getattr(spec_info, "extend_seq_lens_tensor", None)
                 if extend_seq_lens is not None:
                     qo_seq_lens = extend_seq_lens[:bs].to(torch.int32)
@@ -288,7 +288,16 @@ class TritonAttnBackend(AttentionBackend):
                             device=self.device,
                         )
                     else:
-                        qo_seq_lens = spec_info.accept_length[:bs]
+                        default_extend = int(
+                            getattr(
+                                spec_info,
+                                "num_tokens_per_req",
+                                self.speculative_num_steps + 1,
+                            )
+                        )
+                        qo_seq_lens = torch.full(
+                            (bs,), default_extend, dtype=torch.int32, device=self.device
+                        )
                 qo_indptr = self.qo_indptr[: bs + 1]
                 qo_indptr[0] = 0
                 qo_indptr[1 : bs + 1] = torch.cumsum(qo_seq_lens, dim=0)
