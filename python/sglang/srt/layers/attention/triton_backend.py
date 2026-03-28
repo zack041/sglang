@@ -342,6 +342,7 @@ class TritonAttnBackend(AttentionBackend):
                     bs,
                     self.device,
                     self.token_to_kv_pool_allocator,
+                    query_lens=forward_batch.extend_seq_lens,
                 )
 
             qo_indptr = self.qo_indptr
@@ -637,10 +638,25 @@ class TritonAttnBackend(AttentionBackend):
             mask_indptr[1 : bs + 1] = torch.cumsum(seq_mask_len, dim=0)
         elif forward_mode.is_draft_extend(include_v2=True):
             seq_lens = seq_lens[:bs]
-            accept_lens = spec_info.accept_length[:bs]
+            extend_seq_lens = getattr(spec_info, "extend_seq_lens_tensor", None)
+            if extend_seq_lens is not None:
+                qo_seq_lens = extend_seq_lens[:bs].to(torch.int32)
+            else:
+                extend_seq_lens_cpu = getattr(
+                    spec_info, "extend_seq_lens_cpu", None
+                )  # flashattention backend style fallback
+                if extend_seq_lens_cpu is not None and len(extend_seq_lens_cpu) >= bs:
+                    qo_seq_lens = torch.as_tensor(
+                        extend_seq_lens_cpu[:bs],
+                        dtype=torch.int32,
+                        device=self.device,
+                    )
+                else:
+                    # fallback for v1 path
+                    qo_seq_lens = spec_info.accept_length[:bs]
             qo_indptr = self.qo_indptr[: bs + 1]
             qo_indptr[0] = 0
-            qo_indptr[1 : bs + 1] = torch.cumsum(accept_lens, dim=0)
+            qo_indptr[1 : bs + 1] = torch.cumsum(qo_seq_lens, dim=0)
             kv_indptr = self.kv_indptr[: bs + 1]
             kv_indptr[1 : bs + 1] = torch.cumsum(seq_lens, dim=0)
             kv_indices = self.cuda_graph_kv_indices
@@ -724,11 +740,16 @@ class TritonAttnBackend(AttentionBackend):
         ):
             causal = False
 
-        if layer.sliding_window_size is not None and layer.sliding_window_size > -1:
+        if (
+            layer.sliding_window_size is not None
+            and layer.sliding_window_size > -1
+            and self.forward_metadata.window_kv_indices is not None
+            and self.forward_metadata.window_kv_offsets is not None
+        ):
             sliding_window_size = layer.sliding_window_size
-            kv_indptr = self.forward_metadata.kv_indptr
-            kv_indices = self.forward_metadata.kv_indices
-            window_start_pos = None
+            kv_indptr = self.forward_metadata.window_kv_indptr
+            kv_indices = self.forward_metadata.window_kv_indices
+            window_start_pos = self.forward_metadata.window_kv_offsets
         else:
             sliding_window_size = -1
             kv_indptr = self.forward_metadata.kv_indptr
@@ -1004,11 +1025,13 @@ def update_sliding_window_buffer(
     bs,
     device,
     token_to_kv_pool_allocator=None,
+    query_lens=None,
 ):
-    window_kv_lens = torch.minimum(
-        seq_lens,
-        torch.tensor(sliding_window_size),
-    )
+    # for extend with q_len > 1, we expand the cached window by (q_len - 1) so the earliest query token in the chunk still has its full sliding context
+    window_span = torch.full_like(seq_lens, sliding_window_size)
+    if query_lens is not None:
+        window_span = window_span + torch.clamp(query_lens - 1, min=0)
+    window_kv_lens = torch.minimum(seq_lens, window_span)
     window_kv_indptr[1 : bs + 1] = torch.cumsum(window_kv_lens, dim=0)
     window_kv_indptr = window_kv_indptr[: bs + 1]
     window_kv_indices = torch.empty(
