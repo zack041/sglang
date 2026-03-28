@@ -271,10 +271,27 @@ class TritonAttnBackend(AttentionBackend):
 
         elif forward_batch.forward_mode.is_draft_extend(include_v2=True):
             if forward_batch.forward_mode.is_draft_extend_v2():
-                accept_lens = spec_info.accept_length[:bs]
+                extend_seq_lens = getattr(spec_info, "extend_seq_lens_tensor", None)
+                if extend_seq_lens is not None:
+                    qo_seq_lens = extend_seq_lens[:bs].to(torch.int32)
+                else:
+                    extend_seq_lens_cpu = getattr(
+                        spec_info, "extend_seq_lens_cpu", None
+                    )
+                    if (
+                        extend_seq_lens_cpu is not None
+                        and len(extend_seq_lens_cpu) >= bs
+                    ):
+                        qo_seq_lens = torch.as_tensor(
+                            extend_seq_lens_cpu[:bs],
+                            dtype=torch.int32,
+                            device=self.device,
+                        )
+                    else:
+                        qo_seq_lens = spec_info.accept_length[:bs]
                 qo_indptr = self.qo_indptr[: bs + 1]
                 qo_indptr[0] = 0
-                qo_indptr[1 : bs + 1] = torch.cumsum(accept_lens, dim=0)
+                qo_indptr[1 : bs + 1] = torch.cumsum(qo_seq_lens, dim=0)
                 kv_indptr = self.kv_indptr[: bs + 1]
                 kv_indptr[1 : bs + 1] = torch.cumsum(forward_batch.seq_lens, dim=0)
                 kv_indices = torch.empty(
@@ -293,7 +310,7 @@ class TritonAttnBackend(AttentionBackend):
                 )
                 custom_mask = None
                 mask_indptr = None
-                max_extend_len = torch.max(accept_lens).item()
+                max_extend_len = torch.max(qo_seq_lens).item()
             else:
                 kv_indices, kv_indptr, qo_indptr, custom_mask = (
                     spec_info.generate_attn_arg_prefill(
@@ -506,10 +523,22 @@ class TritonAttnBackend(AttentionBackend):
             mask_indptr[1 : bs + 1] = torch.cumsum(seq_mask_len, dim=0)
             max_extend_len = self.num_draft_tokens
         elif forward_mode.is_draft_extend(include_v2=True):
-            accept_lens = spec_info.accept_length[:bs]
+            extend_seq_lens = getattr(spec_info, "extend_seq_lens_tensor", None)
+            if extend_seq_lens is not None:
+                qo_seq_lens = extend_seq_lens[:bs].to(torch.int32)
+            else:
+                extend_seq_lens_cpu = getattr(spec_info, "extend_seq_lens_cpu", None)
+                if extend_seq_lens_cpu is not None and len(extend_seq_lens_cpu) >= bs:
+                    qo_seq_lens = torch.as_tensor(
+                        extend_seq_lens_cpu[:bs],
+                        dtype=torch.int32,
+                        device=self.device,
+                    )
+                else:
+                    qo_seq_lens = spec_info.accept_length[:bs]
             qo_indptr = self.qo_indptr[: bs + 1]
             qo_indptr[0] = 0
-            qo_indptr[1 : bs + 1] = torch.cumsum(accept_lens, dim=0)
+            qo_indptr[1 : bs + 1] = torch.cumsum(qo_seq_lens, dim=0)
             kv_indptr = self.kv_indptr[: bs + 1]
             kv_indptr[1 : bs + 1] = torch.cumsum(seq_lens, dim=0)
             kv_indices = self.cuda_graph_kv_indices
@@ -524,7 +553,7 @@ class TritonAttnBackend(AttentionBackend):
             )
             custom_mask = None
             mask_indptr = None
-            max_extend_len = torch.max(accept_lens).item()
+            max_extend_len = torch.max(qo_seq_lens).item()
         else:
             raise ValueError(
                 f"Invalid forward mode: {forward_mode=} for CUDA Graph capture."
