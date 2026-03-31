@@ -13,6 +13,7 @@ from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.speculative.spec_utils import generate_draft_decode_kv_indices
 from sglang.srt.utils import (
+    get_device_core_count,
     next_power_of_2,
 )
 
@@ -132,9 +133,11 @@ class TritonAttnBackend(AttentionBackend):
 
         # Initialize forward metadata
         self.forward_metadata: ForwardMetadata = None
-
+        self.device_core_count = get_device_core_count(model_runner.gpu_id)
         self.seq_threshold_3D = max(1, 128 // self.num_kv_head)
-        self.num_par_softmax_segments = 16
+        self.num_par_softmax_segments = max(
+            16, next_power_of_2(self.device_core_count // 4)
+        )
         headdim_padded = next_power_of_2(
             model_runner.token_to_kv_pool.get_key_buffer(0).shape[-1]
         )
