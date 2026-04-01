@@ -16,8 +16,9 @@ from sglang.srt.layers.attention.triton_backend import TritonMultiStepDraftBacke
 from sglang.srt.layers.attention.triton_mla_backend import (
     TritonMLAMultiStepDraftBackend,
 )
+from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
 from sglang.srt.layers.attention.trtllm_mla_backend import (
-    TRTLLMMLAMultiStepDraftBackend,
+    TRTLLMMLABackend,
 )
 from sglang.srt.layers.dp_attention import get_attention_tp_group
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
@@ -300,6 +301,8 @@ class EagleDraftWorker(BaseDraftWorker):
             isinstance(self.draft_attn_backend, TritonMultiStepDraftBackend)
             or isinstance(self.draft_attn_backend, TritonMLAMultiStepDraftBackend)
             or isinstance(self.draft_attn_backend, TRTLLMMLAMultiStepDraftBackend)
+            or isinstance(self.draft_extend_attn_backend, TritonAttnBackend)
+            or isinstance(self.draft_extend_attn_backend, TRTLLMMLABackend)
         )
         # Capture extend
         # TODO: support draft extend cuda graph for more attention backends
